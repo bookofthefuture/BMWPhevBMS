@@ -20,6 +20,43 @@
 
   Thank you to James Warner for proving out canbus decoding and finding balancing bits
 */
+//*****RLG Includes:*************************************
+//Needs ACAN2515.h included before FlexCAN to avoid compile error
+#include "Can2.h"
+//#include "SimpBMSscreen1.h"
+
+can2Frame Can2Frame; // struct for data to send from SimpBMS to Can2 to VCU (declared in Can2.h)
+
+//*****END RLG Includes:*************************************
+
+//  TC includes - Modified from original charge controller sketch from Dilbert on Open Inverter forums
+// stripped down to remove push button (charging triggered by handle), serial comms, and LEDs (since short on pins and under bonnet)
+const int TARGET_VOLTAGE = 300; // CHARGER IGNORES THIS BUT SCRIPT USES IT TO STOP CHARGE WHEN TARGET VOLTAGE REACHED.
+const int CHARGE_CURRENT = 10; // 10X SCALING SO 10 = 1A
+const int PP_PIN = A2;
+
+/********** end tc additions ****************/
+
+int state = 0;
+int prox;
+int prox_state = 0;
+int flag;
+unsigned int timer = 0;
+int last_state = 0;
+int count = 0;
+int charger_evse_req = 3;
+int pilot;
+int charger_hb = 0;
+int charger_current_sp = 0;
+int charger_voltage_sp = 0;
+int slow_flag_counter = 0;
+int slow_flag = 0;
+int bat_voltage = 0;
+int evse_pilot = 0;
+int charger_can_alive = 0;
+int supply_voltage = 0;
+
+// end outlander charger stuff
 
 #include "BMSModuleManager.h"
 #include <Arduino.h>
@@ -33,6 +70,7 @@
 #include <SPI.h>
 #include <Filters.h>//https://github.com/JonHub/Filters
 
+
 #define RESTART_ADDR       0xE000ED0C
 #define READ_RESTART()     (*(volatile uint32_t *)RESTART_ADDR)
 #define WRITE_RESTART(val) ((*(volatile uint32_t *)RESTART_ADDR) = (val))
@@ -43,7 +81,7 @@ SerialConsole console;
 EEPROMSettings settings;
 
 /////Version Identifier/////////
-int firmver = 100720;
+int firmver = 030720;
 
 //Curent filter//
 float filterFrequency = 5.0 ;
@@ -53,19 +91,19 @@ FilterOnePole lowpassFilter( LOWPASS, filterFrequency );
 const int ACUR2 = A0; // current 1
 const int ACUR1 = A1; // current 2
 const int IN1 = 17; // input 1 - high active
-const int IN2 = 16; // input 2- high active
-const int IN3 = 18; // input 1 - high active
+const int IN2 = 16; // input 2- high active - NOW USED AS A2 FOR PP
+const int IN3 = 18; // input 1 - high active - SWITCH FOR CHARGING MODE WHEN PULLED HIGH
 const int IN4 = 19; // input 2- high active
-const int OUT1 = 11;// output 1 - high active
-const int OUT2 = 12;// output 2 - high active
+const int OUT1 = 20;// output 1 - high active
+const int OUT2 = 20;// output 2 - high active
 const int OUT3 = 20;// output 3 - high active
 const int OUT4 = 21;// output 4 - high active
 const int OUT5 = 22;// output 5 - Low active
 const int OUT6 = 23;// output 6 - Low active
 const int OUT7 = 5;// output 7 - Low active
 const int OUT8 = 6;// output 8 - Low active
-const int led = 13;
-const int BMBfault = 11;
+const int led = 5;
+const int BMBfault = 1;
 
 byte bmsstatus = 0;
 //bms status values
@@ -90,6 +128,8 @@ byte bmsstatus = 0;
 #define Eltek 3
 #define Elcon 4
 #define HVSBS 5
+#define Outlander 7
+
 //
 
 //CSC Variants
@@ -197,8 +237,7 @@ uint8_t Imod, mescycle = 0;
 uint8_t nextmes = 0;
 uint16_t commandrate = 50;
 uint8_t testcycle = 0;
-uint8_t DMC[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-uint8_t Unassigned, NextID = 0;
+
 
 //BMW checksum variable///
 
@@ -239,7 +278,7 @@ void loadSettings()
   settings.logLevel = 2;
   settings.CAP = 100; //battery size in Ah
   settings.Pstrings = 1; // strings in parallel used to divide voltage of pack
-  settings.Scells = 12;//Cells in series
+  settings.Scells = 80;//Cells in series
   settings.StoreVsetpoint = 3.8; // V storage mode charge max
   settings.discurrentmax = 300; // max discharge current in 0.1A
   settings.DisTaper = 0.3f; //V offset to bring in discharge taper to Zero Amps at settings.DischVsetpoint
@@ -287,8 +326,8 @@ void setup()
   //pinMode(ACUR1, INPUT);//Not required for Analogue Pins
   //pinMode(ACUR2, INPUT);//Not required for Analogue Pins
   pinMode(IN1, INPUT);
-  pinMode(IN2, INPUT);
-  pinMode(IN3, INPUT);
+  pinMode(IN2, INPUT); //now used as analogue input for PP
+  pinMode(IN3, INPUT); // pull to 3v3 for charge mode - pin 18
   pinMode(IN4, INPUT);
   pinMode(OUT1, OUTPUT); // drive contactor
   pinMode(OUT2, OUTPUT); // precharge
@@ -306,6 +345,7 @@ void setup()
   analogWriteFrequency(OUT8, pwmfreq);
 
   Can0.begin(500000);
+  Can2Setup();
 
   //set filters for standard
   for (int i = 0; i < 8; i++)
@@ -336,7 +376,7 @@ void setup()
   SERIALCONSOLE.println("Starting up!");
   SERIALCONSOLE.println("SimpBMS V2 BMW I3");
 
-  Serial2.begin(115200);
+  //Serial2.begin(115200);
 
   // Display reason the Teensy was last reset
   Serial.println();
@@ -372,10 +412,10 @@ void setup()
   /////////////////
 
 
-  SERIALBMS.begin(612500); //Tesla serial bus
+ // SERIALBMS.begin(612500); //Tesla serial bus
   //VE.begin(19200); //Victron VE direct bus
 #if defined (__arm__) && defined (__SAM3X8E__)
-  serialSpecialInit(USART0, 612500); //required for Due based boards as the stock core files don't support 612500 baud.
+ // serialSpecialInit(USART0, 612500); //required for Due based boards as the stock core files don't support 612500 baud.
 #endif
 
   SERIALCONSOLE.println("Started serial interface to BMS.");
@@ -390,7 +430,7 @@ void setup()
   lastUpdate = 0;
 
   crc8.begin();
-  digitalWrite(led, HIGH);
+  //digitalWrite(led, HIGH);
   bms.setPstrings(settings.Pstrings);
   bms.setSensors(settings.IgnoreTemp, settings.IgnoreVolt, settings.TempOff);
 
@@ -401,10 +441,12 @@ void setup()
   //precharge timer kickers
   Pretimer = millis();
   Pretimer1  = millis();
+
+//  ScreenSetup();
 }
 
 void loop()
-{
+{ 
   while (Can0.available())
   {
     canread();
@@ -892,15 +934,6 @@ void loop()
       bms.setBalIgnore(false);
     }
 
-    ///Set Ids to unnasgined//
-
-    if (Unassigned > 0)
-    {
-      assignID();
-    }
-
-    ////
-
     resetwdog();
   }
   if (millis() - cleartime > 5000)
@@ -948,6 +981,13 @@ void loop()
       }
     }
   }
+
+  //***********************************************************
+//  ScreenLoop();
+//  VCUcommsRLG();
+  //***********************************************************
+
+  
 }
 
 void alarmupdate()
@@ -1333,7 +1373,7 @@ void getcurrent()
       lasttime = millis();
     }
   }
-  RawCur = 0;
+  RawCur = 0;  
 }
 
 
@@ -1601,6 +1641,26 @@ void calcur()
   SERIALCONSOLE.print(" current offset 2 calibrated ");
   SERIALCONSOLE.println("  ");
 }
+
+void VCUcommsRLG()
+{
+  // using Can2 on MCP2515 and ACAN2515 via Can2.h
+        Can2Frame.Can2_ext  = false;
+        Can2Frame.Can2_rtr  = false;
+        Can2Frame.Can2_id   = 0x356;
+        Can2Frame.Can2_len  = 8;
+        Can2Frame.Can2_d[0] = lowByte(uint16_t(bms.getPackVoltage() * 100));
+        Can2Frame.Can2_d[1] = highByte(uint16_t(bms.getPackVoltage() * 100));
+        Can2Frame.Can2_d[2] = lowByte(long(currentact / 100));
+        Can2Frame.Can2_d[3] = highByte(long(currentact / 100));
+        Can2Frame.Can2_d[4] = lowByte(int16_t(bms.getAvgTemperature() * 10));
+        Can2Frame.Can2_d[5] = highByte(int16_t(bms.getAvgTemperature() * 10));
+        Can2Frame.Can2_d[6] = 0;
+        Can2Frame.Can2_d[7] = 0;
+        
+        Can2Send(Can2Frame);
+}
+
 
 void VEcan() //communication with Victron system over CAN
 {
@@ -2092,22 +2152,6 @@ void menu()
         incomingByte = 'd';
         break;
 
-      case 'x':
-        menuload = 1;
-        resetIDdebug();
-        incomingByte = 'd';
-        break;
-
-      case 'y':
-        menuload = 1;
-        if (Serial.available() > 0)
-        {
-          NextID = Serial.parseInt();
-        }
-
-        incomingByte = 'd';
-        break;
-
       case 113: //q for quite menu
 
         menuload = 0;
@@ -2373,9 +2417,9 @@ void menu()
         }
         break;
 
-      case '5': //1 Over Voltage Setpoint
+      case '5': //1 Charger Type 
         settings.chargertype = settings.chargertype + 1;
-        if (settings.chargertype > 6)
+        if (settings.chargertype > 7)
         {
           settings.chargertype = 0;
         }
@@ -2784,6 +2828,9 @@ void menu()
           case 6:
             SERIALCONSOLE.print("HV SBS");
             break;
+          case 7: 
+            SERIALCONSOLE.print("Outlander Charger");
+            break;
         }
         SERIALCONSOLE.println();
         if (settings.chargertype > 0)
@@ -2915,15 +2962,6 @@ void menu()
         SERIALCONSOLE.print("b - balance duration :");
         SERIALCONSOLE.print(settings.balanceDuty);
         SERIALCONSOLE.println(" S time before starting is 60s");
-
-        ///Testing ID assignment///
-        SERIALCONSOLE.print("y - NextID :");
-        SERIALCONSOLE.print(NextID);
-        SERIALCONSOLE.println();
-        SERIALCONSOLE.print("x - wipe CSC ids");
-        SERIALCONSOLE.println("");
-        ///////////
-
         SERIALCONSOLE.println("r - reset balance debug");
         SERIALCONSOLE.println("q - Go back to menu");
         menuload = 4;
@@ -3129,40 +3167,6 @@ void canread()
   {
     CAB300();
   }
-
-
-  //ID not assigned//
-  if (inMsg.id == 0xF0)
-  {
-    Unassigned++;
-    Serial.print(millis());
-    if ((inMsg.id & 0x80000000) == 0x80000000)    // Determine if ID is standard (11 bits) or extended (29 bits)
-      sprintf(msgString, "Extended ID: 0x%.8lX  DLC: %1d  Data:", (inMsg.id & 0x1FFFFFFF), inMsg.len);
-    else
-      sprintf(msgString, ",0x%.3lX,false,%1d", inMsg.id, inMsg.len);
-
-    Serial.print(msgString);
-
-    if ((inMsg.id & 0x40000000) == 0x40000000) {  // Determine if message is a remote request frame.
-      sprintf(msgString, " REMOTE REQUEST FRAME");
-      Serial.print(msgString);
-    } else {
-      for (byte i = 0; i < inMsg.len; i++) {
-        sprintf(msgString, ", 0x%.2X", inMsg.buf[i]);
-        DMC[i] = inMsg.buf[i];
-        Serial.print(msgString);
-      }
-    }
-
-    Serial.println();
-    for (byte i = 0; i < 8; i++)
-    {
-      Serial.print(DMC[i], HEX);
-      Serial.print("|");
-    }
-    Serial.println();
-  }
-  ////
 
   if (inMsg.id > 0x99 && inMsg.id < 0x180)//do BMS magic if ids are ones identified to be modules
   {
@@ -3420,36 +3424,24 @@ void balancing()
 
 void sendcommand() //Send Can Command to get data from slaves
 {
-  ///////module id cycling/////////
-
-  if (nextmes == 6)
+  if (mescycle == 0xF)
   {
-    mescycle ++;
-    nextmes = 0;
-    if (testcycle < 4)
+    mescycle = 0;
+
+    if (balancetimer < millis())
     {
-      testcycle++;
+      balancepauze = 1;
+      if (debug == 1)
+      {
+        Serial.println();
+        Serial.println("Reset Balance Timer");
+        Serial.println();
+      }
+      balancetimer = millis() + ((settings.balanceDuty + 60) * 1000);
     }
-
-    if (mescycle == 0xF)
+    else
     {
-      mescycle = 0;
-
-      if (balancetimer < millis())
-      {
-        balancepauze = 1;
-        if (debug == 1)
-        {
-          Serial.println();
-          Serial.println("Reset Balance Timer");
-          Serial.println();
-        }
-        balancetimer = millis() + ((settings.balanceDuty + 60) * 1000);
-      }
-      else
-      {
-        balancepauze = 0;
-      }
+      balancepauze = 0;
     }
   }
   if (balancepauze == 1)
@@ -3457,21 +3449,34 @@ void sendcommand() //Send Can Command to get data from slaves
     balancecells = 0;
   }
 
+  ///////module id cycling/////////
+
+  if (nextmes == 6)
+  {
+    nextmes = 0;
+    if (testcycle < 4)
+    {
+      testcycle++;
+    }
+  }
+
 
   msg.id  = 0x080 | (nextmes);
   msg.len = 8;
   if (balancecells == 1)
   {
-    msg.buf[0] = lowByte((uint16_t((bms.getLowCellVolt()) * 1000) + 5));
-    msg.buf[1] = highByte((uint16_t((bms.getLowCellVolt()) * 1000) + 5));
+    msg.buf[0] = lowByte((uint16_t((bms.getLowCellVolt()) * 1000) + 10));
+    msg.buf[1] = highByte((uint16_t((bms.getLowCellVolt()) * 1000) + 10));
   }
   else
   {
-    msg.buf[0] = 0xC7;
-    msg.buf[1] = 0x10;
+    msg.buf[0] = 0x42;
+    msg.buf[1] = 0x0E;
   }
   msg.buf[2] = 0x00; //balancing bits
   msg.buf[3] = 0x00; //balancing bits
+
+
 
   if (testcycle < 3)
   {
@@ -3483,11 +3488,11 @@ void sendcommand() //Send Can Command to get data from slaves
 
     if (balancecells == 1)
     {
-      msg.buf[4] = 0x48;
+      msg.buf[4] = 0x68;
     }
     else
     {
-      msg.buf[4] = 0x40;
+      msg.buf[4] = 0x60;
     }
     msg.buf[5] = 0x01;
   }
@@ -3502,6 +3507,7 @@ void sendcommand() //Send Can Command to get data from slaves
 
   delay(2);
   Can0.write(msg);
+  mescycle ++;
   nextmes ++;
 
   if (bms.checkstatus() == true)
@@ -3770,6 +3776,188 @@ void chargercomms()
     }
     Can0.write(msg);
   }
+if (settings.chargertype == Outlander)
+ {
+//    SERIALCONSOLE.println("Outlander Charging");
+    bat_voltage = bms.getPackVoltage();
+
+  // get supply voltage and pilot signal from charger over CAN
+  CANMessage incoming;
+
+  if (Can2.available() > 0) {
+//      SERIALCONSOLE.println("CAN 2 receiving");
+    Can2.receive(incoming);
+    //    printFrame(incoming);
+
+    if (incoming.id == 0x389) {
+
+      supply_voltage = incoming.data[1];
+      charger_can_alive++;
+    }
+    if (incoming.id == 0x38A) {
+      evse_pilot = incoming.data[3];
+      charger_can_alive++;
+    }
+  }
+
+  //Send voltage and current data to charger
+  if (count == 50) {
+//    SERIALCONSOLE.println("Sending charger data");
+    sendChargerSPData(charger_voltage_sp, charger_current_sp);
+  }
+  // Send on/off information to charger
+  else if ((count % 10) == 0) {
+    sendEVSEData(charger_evse_req, charger_hb);
+  }
+
+  if (count > 100) {
+
+    //Maybe able to get rid of flag but slow flag counter is used for more than flashing LEDs!
+    if (flag) {
+      flag = 0;
+    }
+    else {
+      flag = 1;
+    }
+
+
+    if (slow_flag_counter < 10)slow_flag_counter++;
+    else {
+      slow_flag_counter = 0;
+      charger_hb++;
+      charger_hb &= 0x1F;
+      if (slow_flag)slow_flag = 0;
+      else slow_flag = 1;
+    }
+
+    // Read the voltage on the PP line through a voltage bridge. Tie to 3v3 with a 1K2 reSistor.
+    prox = analogRead(PP_PIN);
+//    SERIALCONSOLE.print("Prox: ");
+//    SERIALCONSOLE.println(prox);
+
+    if (prox < 4000) {
+      //      digitalWrite(PROX_STATUS_LED, HIGH);
+      prox_state = 2;
+    }
+    else if (prox < 6000) {
+      //      digitalWrite(PROX_STATUS_LED, HIGH);
+      prox_state = 1;
+    }
+    else {
+      //      digitalWrite(PROX_STATUS_LED, LOW);
+      prox_state = 0;
+    }
+        SERIALCONSOLE.print("Prox_state:");
+        SERIALCONSOLE.println(prox_state);
+
+    // State machine that moves through the phases to pull in the EVSE and begin charging
+    switch (state) {
+
+      case 0:
+        SERIALCONSOLE.println("State: 0");
+        if (prox_state == 1) {
+          state++;
+          //          digitalWrite(CHARGER_POWER, HIGH);
+          charger_evse_req = 3;
+        }
+        break;
+
+      case 1:
+        SERIALCONSOLE.println("State: 1");
+        // start sequence for pulling in EVSE
+        if (timer > 10) {
+          charger_evse_req = 0x16;
+          state++;
+          //          digitalWrite(CHARGER_STATUS_LED, HIGH);
+          //          Serial.print("bat_voltage ");
+          //          Serial.println(bat_voltage);
+        }
+
+        break;
+
+      case 2:
+        SERIALCONSOLE.println("State: 2");
+        //EV
+        if (timer > 10) {
+          charger_evse_req = 0xb6;
+          state++;
+          //          Serial.print("evse_pilot ");
+          //          Serial.println(evse_pilot);
+        }
+        break;
+
+      case 3:
+        SERIALCONSOLE.println("State: 3");
+        if (timer > 10) {
+
+          //Check EVSE has pulled in, by checking pwoer to charger!
+          //           Serial.print("supply_voltage ");
+          //          Serial.println(supply_voltage);
+
+          //if EVSE hasn't pulled in, quit and flash fault LED
+
+          charger_current_sp = 10;
+          charger_voltage_sp = TARGET_VOLTAGE + 10;
+          // Ramp charge current to TARGET CURRENT
+          // when we hit top of ramp, jump to the next state
+          state++;
+        }
+        break;
+
+      case 4:
+        SERIALCONSOLE.println("State: 4");
+
+        //Charging
+        //Monitor battery voltage, only bring it to TARGET VOLTAGE, before dropping out
+
+        //        digitalWrite(CHARGER_STATUS_LED, flag);
+        if (prox_state != 1) {
+          state = 0;
+          charger_current_sp = 0;
+          charger_voltage_sp = 0;
+        }
+
+        if (bat_voltage > TARGET_VOLTAGE) {
+          state = 5;
+          charger_current_sp = 0;
+          charger_voltage_sp = 0;
+          //           Serial.println("charge complete");
+          //           Serial.println(bat_voltage);
+        }
+
+        break;
+
+      case 5:
+        SERIALCONSOLE.println("State: 5");
+        //Charge Complete state
+        //      digitalWrite(CHARGER_STATUS_LED, slow_flag);
+
+        break;
+
+      case 6:
+        //        Serial.println("State: 6");
+        //fault state!
+
+        break;
+
+    }
+    //Reset timer on each state change
+    if (timer < 65535)timer++;
+    if (state != last_state) timer = 0;
+
+    last_state = state;
+
+    //Serial.println(analogRead(A0));
+
+    count = 0;
+  }
+  else {
+    count++;
+  }
+
+  delay(1);
+
+  }
 }
 
 uint8_t getcheck(CAN_message_t &msg, int id)
@@ -3811,104 +3999,45 @@ void resetbalancedebug()
   Can0.write(msg);
 }
 
-void resetIDdebug()
+void sendEVSEData(int val, int hb)
 {
-  //Rest all possible Ids
-  for (int ID = 0; ID < 15; ID++)
-  {
-    msg.id  =  0x0A0; //broadcast to all CSC
-    msg.len = 8;
-    msg.ext = 0;
-    msg.buf[0] = 0xA1;
-    msg.buf[1] = ID;
-    msg.buf[2] = 0xFF;
-    msg.buf[3] = 0xFF;
-    msg.buf[4] = 0xFF;
-    msg.buf[5] = 0xFF;
-    msg.buf[6] = 0xFF;
-    msg.buf[7] = 0xFF;
+   // using Can2 on MCP2515 and ACAN2515 via Can2.h
+  Can2Frame.Can2_ext  = false;
+  Can2Frame.Can2_rtr  = false;
+  Can2Frame.Can2_id   = 0x285;
+  Can2Frame.Can2_len  = 8;
+  Can2Frame.Can2_d[0] = 0;
+  Can2Frame.Can2_d[1] = 0;
+  Can2Frame.Can2_d[2] = val;
+  Can2Frame.Can2_d[3] = 9;
+  Can2Frame.Can2_d[4] = hb;
+  Can2Frame.Can2_d[5] = 0;
+  if (val == 0xb6)
+    Can2Frame.Can2_d[6] = 0;
+  else
+    Can2Frame.Can2_d[6] = 8;
+  Can2Frame.Can2_d[7] = 0xa;
 
-    Can0.write(msg);
-
-    delay(2);
-  }
-  //NextID = 0;
-
-  //check for found unassigned CSC
-  Unassigned = 0;
-
-  msg.id  =  0x0A0; //broadcast to all CSC
-  msg.len = 8;
-  msg.ext = 0;
-  msg.buf[0] = 0x37;
-  msg.buf[1] = 0xFF;
-  msg.buf[2] = 0xFF;
-  msg.buf[3] = 0xFF;
-  msg.buf[4] = 0xFF;
-  msg.buf[5] = 0xFF;
-  msg.buf[6] = 0xFF;
-  msg.buf[7] = 0xFF;
-
-  Can0.write(msg);
-
+  Can2Send(Can2Frame);
 }
 
-void findUnassigned ()
+void sendChargerSPData(int voltage, int current)
 {
-  Unassigned = 0;
-  //check for found unassigned CSC
-  msg.id  =  0x0A0; //broadcast to all CSC
-  msg.len = 8;
-  msg.ext = 0;
-  msg.buf[0] = 0x37;
-  msg.buf[1] = 0xFF;
-  msg.buf[2] = 0xFF;
-  msg.buf[3] = 0xFF;
-  msg.buf[4] = 0xFF;
-  msg.buf[5] = 0xFF;
-  msg.buf[6] = 0xFF;
-  msg.buf[7] = 0xFF;
+//  SERIALCONSOLE.println("SendChargerSPData");   
+  voltage *= 10;
+  // using Can2 on MCP2515 and ACAN2515 via Can2.h
+  Can2Frame.Can2_ext  = false;
+  Can2Frame.Can2_rtr  = false;
+  Can2Frame.Can2_id   = 0x286;
+  Can2Frame.Can2_len  = 8;
+  Can2Frame.Can2_d[0] = voltage >> 8;
+  Can2Frame.Can2_d[1] = voltage &= 0xFF;
+  Can2Frame.Can2_d[2] = current;
+  Can2Frame.Can2_d[3] = 51;
+  Can2Frame.Can2_d[4] = 0x0;
+  Can2Frame.Can2_d[5] = 0x0;
+  Can2Frame.Can2_d[6] = 0xa;
+  Can2Frame.Can2_d[7] = 0x0;
 
-  Can0.write(msg);
-}
-
-void assignID()
-{
-  msg.id  =  0x0A0; //broadcast to all CSC
-  msg.len = 8;
-  msg.ext = 0;
-  msg.buf[0] = 0x12;
-  msg.buf[1] = 0xAB;
-  msg.buf[2] = DMC[0];
-  msg.buf[3] = DMC[1];
-  msg.buf[4] = DMC[2];
-  msg.buf[5] = DMC[3];
-  msg.buf[6] = 0xFF;
-  msg.buf[7] = 0xFF;
-
-  Can0.write(msg);
-
-  delay(30);
-
-  msg.buf[1] = 0xBA;
-  msg.buf[2] = DMC[4];
-  msg.buf[3] = DMC[5];
-  msg.buf[4] = DMC[6];
-  msg.buf[5] = DMC[7];
-
-  Can0.write(msg);
-
-  delay(10);
-  msg.buf[0] = 0x5B;
-  msg.buf[1] = NextID;
-  Can0.write(msg);
-
-  delay(10);
-  msg.buf[0] = 0x37;
-  msg.buf[1] = NextID;
-  Can0.write(msg);
-
-  NextID++;
-
-  findUnassigned();
+  Can2Send(Can2Frame);
 }

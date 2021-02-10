@@ -13,7 +13,7 @@ public:
     void decodetemp(CAN_message_t &msg, int debug, int CSC);
     void balanceCells();
     void setupBoards();
-        bool checkcomms();
+    bool checkcomms();
     bool checkstatus();
     void findBoards();
     void renumberBoardIDs();
@@ -30,7 +30,7 @@ public:
     void setSensors(int sensor,float Ignore, int tempoff);
     float getPackVoltage();
     float getAvgTemperature();
-        float getHighTemperature();
+    float getHighTemperature();
     float getLowTemperature();
     float getAvgCellVolt();
     float getLowCellVolt();
@@ -57,7 +57,7 @@ bool BalIgnore;
     float highestPackVolt;
     float lowestPackTemp;
     float highestPackTemp;
-        float highTemp;
+    float highTemp;
     float lowTemp;
     BMSModule modules[MAX_MODULE_ADDR + 1]; // store data for as many modules as we've configured for.
     int batteryID;
